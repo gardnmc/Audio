@@ -16,81 +16,369 @@
 
 package com.example.audio;
 
-import android.Manifest;
-import android.annotation.SuppressLint;
-import android.content.pm.PackageManager;
-import android.content.res.AssetManager;
-import android.media.AudioFormat;
-import android.media.AudioRecord;
-import android.media.MediaRecorder;
-import android.os.Build;
-import android.os.Bundle;
-import android.os.Environment;
-import android.util.Log;
-import android.view.View;
-import android.widget.Button;
-import android.widget.TextView;
-
+import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.concurrent.atomic.AtomicBoolean;
+import android.Manifest;
+import android.annotation.TargetApi;
+import android.app.Activity;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.content.res.AssetManager;
+import android.media.AudioManager;
+import android.media.AudioRecord;
+import android.os.Build;
+import android.os.Bundle;
+import android.view.View;
+import android.view.View.OnClickListener;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
+import android.widget.Button;
+import android.widget.SeekBar;
+import android.widget.SeekBar.OnSeekBarChangeListener;
+import android.widget.Spinner;
+import android.widget.Toast;
 
 /**
  * Sample that demonstrates how to record a device's microphone using {@link AudioRecord}.
  */
 public class AudioRecordActivity extends AppCompatActivity implements ActivityCompat.OnRequestPermissionsResultCallback {
 
-    private static final int SAMPLING_RATE_IN_HZ = 44100;
 
-    private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO;
+    //static final String TAG = "NativeAudio";
+    private static final int AUDIO_ECHO_REQUEST = 0;
 
-    private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
+    static final int CLIP_NONE = 0;
+    static final int CLIP_HELLO = 1;
+    static final int CLIP_ANDROID = 2;
+    static final int CLIP_SAWTOOTH = 3;
+    static final int CLIP_PLAYBACK = 4;
 
-    /**
-     * Factor by that the minimum buffer size is multiplied. The bigger the factor is the less
-     * likely it is that samples will be dropped, but more memory will be used. The minimum buffer
-     * size is determined by {@link AudioRecord#getMinBufferSize(int, int, int)} and depends on the
-     * recording settings.
-     */
-    private static final int BUFFER_SIZE_FACTOR = 2;
+    static String URI;
+    static AssetManager assetManager;
 
-    /**
-     * Size of the buffer where the audio data is stored by Android
-     */
+    static boolean isPlayingAsset = false;
+    static boolean isPlayingUri = false;
 
-    private static final int BUFFER_SIZE = AudioRecord.getMinBufferSize(SAMPLING_RATE_IN_HZ,
-            CHANNEL_CONFIG, AUDIO_FORMAT) * BUFFER_SIZE_FACTOR;
-//
-//    private static final int BUFFER_SIZE = AudioRecord.getMinBufferSize(SAMPLING_RATE_IN_HZ,
-//            CHANNEL_CONFIG, AUDIO_FORMAT);
+    static int numChannelsUri = 0;
 
-    /**
-     * Signals whether a recording is in progress (true) or not (false).
-     */
-    private final AtomicBoolean recordingInProgress = new AtomicBoolean(false);
+    /** Called when the activity is first created. */
 
-    private AudioRecord recorder = null;
+    protected void onCreate(Bundle icicle) {
+        super.onCreate(icicle);
+        setContentView(R.layout.main);
 
-    private Thread recordingThread;
+        assetManager = getAssets();
 
+        // initialize native audio system
+        createEngine();
 
-    private Button startButton;
+        int sampleRate = 0;
+        int bufSize = 0;
+        /*
+         * retrieve fast audio path sample rate and buf size; if we have it, we pass to native
+         * side to create a player with fast audio enabled [ fast audio == low latency audio ];
+         * IF we do not have a fast audio path, we pass 0 for sampleRate, which will force native
+         * side to pick up the 8Khz sample rate.
+         */
+        if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            AudioManager myAudioMgr = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+            String nativeParam = myAudioMgr.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE);
+            sampleRate = Integer.parseInt(nativeParam);
+            nativeParam = myAudioMgr.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER);
+            bufSize = Integer.parseInt(nativeParam);
+        }
+        createBufferQueueAudioPlayer(sampleRate, bufSize);
 
-    private Button stopButton;
+        // initialize URI spinner
+        Spinner uriSpinner = (Spinner) findViewById(R.id.uri_spinner);
+        ArrayAdapter<CharSequence> uriAdapter = ArrayAdapter.createFromResource(
+                this, R.array.uri_spinner_array, android.R.layout.simple_spinner_item);
+        uriAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        uriSpinner.setAdapter(uriAdapter);
+        uriSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
 
-    private TextView blockCountTv;
-    private int block_count = 0;
+            public void onItemSelected(AdapterView<?> parent, View view, int pos, long id) {
+                URI = parent.getItemAtPosition(pos).toString();
+            }
 
-//
-//    public native String Java_com_example_audio_AudioRecordActivity_stringFromJNI();
-//    public native int test(int i);
-//    public native short get_max(ByteBuffer dta, int size);
+            public void onNothingSelected(AdapterView parent) {
+                URI = null;
+            }
 
+        });
+
+        // initialize button click handlers
+
+        ((Button) findViewById(R.id.hello)).setOnClickListener(new OnClickListener() {
+            public void onClick(View view) {
+                // ignore the return value
+                selectClip(CLIP_HELLO, 5);
+            }
+        });
+
+        ((Button) findViewById(R.id.android)).setOnClickListener(new OnClickListener() {
+            public void onClick(View view) {
+                // ignore the return value
+                selectClip(CLIP_ANDROID, 7);
+            }
+        });
+
+        ((Button) findViewById(R.id.sawtooth)).setOnClickListener(new OnClickListener() {
+            public void onClick(View view) {
+                // ignore the return value
+                selectClip(CLIP_SAWTOOTH, 1);
+            }
+        });
+
+        ((Button) findViewById(R.id.reverb)).setOnClickListener(new OnClickListener() {
+            boolean enabled = false;
+            public void onClick(View view) {
+                enabled = !enabled;
+                if (!enableReverb(enabled)) {
+                    enabled = !enabled;
+                }
+            }
+        });
+
+        ((Button) findViewById(R.id.embedded_soundtrack)).setOnClickListener(new OnClickListener() {
+            boolean created = false;
+            public void onClick(View view) {
+                if (!created) {
+                    created = createAssetAudioPlayer(assetManager, "background.mp3");
+                }
+                if (created) {
+                    isPlayingAsset = !isPlayingAsset;
+                    setPlayingAssetAudioPlayer(isPlayingAsset);
+                }
+            }
+        });
+
+        // native uriPlayer is broken in android 21 and over, internal bug id: b/29321867
+        // will re-open after it is fixed in later OSes
+        ((Button) findViewById(R.id.uri_soundtrack)).setOnClickListener(new OnClickListener() {
+            boolean created = false;
+            public void onClick(View view) {
+                if (!created && URI != null) {
+                    created = createUriAudioPlayer(URI);
+                }
+            }
+        });
+
+        ((Button) findViewById(R.id.pause_uri)).setOnClickListener(new OnClickListener() {
+            public void onClick(View view) {
+                setPlayingUriAudioPlayer(false);
+            }
+        });
+
+        ((Button) findViewById(R.id.play_uri)).setOnClickListener(new OnClickListener() {
+            public void onClick(View view) {
+                setPlayingUriAudioPlayer(true);
+            }
+        });
+
+        ((Button) findViewById(R.id.loop_uri)).setOnClickListener(new OnClickListener() {
+            boolean isLooping = false;
+            public void onClick(View view) {
+                isLooping = !isLooping;
+                setLoopingUriAudioPlayer(isLooping);
+            }
+        });
+
+        ((Button) findViewById(R.id.mute_left_uri)).setOnClickListener(new OnClickListener() {
+            boolean muted = false;
+            public void onClick(View view) {
+                muted = !muted;
+                setChannelMuteUriAudioPlayer(0, muted);
+            }
+        });
+
+        ((Button) findViewById(R.id.mute_right_uri)).setOnClickListener(new OnClickListener() {
+            boolean muted = false;
+            public void onClick(View view) {
+                muted = !muted;
+                setChannelMuteUriAudioPlayer(1, muted);
+            }
+        });
+
+        ((Button) findViewById(R.id.solo_left_uri)).setOnClickListener(new OnClickListener() {
+            boolean soloed = false;
+            public void onClick(View view) {
+                soloed = !soloed;
+                setChannelSoloUriAudioPlayer(0, soloed);
+            }
+        });
+
+        ((Button) findViewById(R.id.solo_right_uri)).setOnClickListener(new OnClickListener() {
+            boolean soloed = false;
+            public void onClick(View view) {
+                soloed = !soloed;
+                setChannelSoloUriAudioPlayer(1, soloed);
+            }
+        });
+
+        ((Button) findViewById(R.id.mute_uri)).setOnClickListener(new OnClickListener() {
+            boolean muted = false;
+            public void onClick(View view) {
+                muted = !muted;
+                setMuteUriAudioPlayer(muted);
+            }
+        });
+
+        ((Button) findViewById(R.id.enable_stereo_position_uri)).setOnClickListener(
+                new OnClickListener() {
+                    boolean enabled = false;
+                    public void onClick(View view) {
+                        enabled = !enabled;
+                        enableStereoPositionUriAudioPlayer(enabled);
+                    }
+                });
+
+        ((Button) findViewById(R.id.channels_uri)).setOnClickListener(new OnClickListener() {
+            public void onClick(View view) {
+                if (numChannelsUri == 0) {
+                    numChannelsUri = getNumChannelsUriAudioPlayer();
+                }
+                Toast.makeText(AudioRecordActivity.this, "Channels: " + numChannelsUri,
+                        Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        ((SeekBar) findViewById(R.id.volume_uri)).setOnSeekBarChangeListener(
+                new OnSeekBarChangeListener() {
+                    int lastProgress = 100;
+                    public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+//                        if (BuildConfig.DEBUG && !(progress >= 0 && progress <= 100)) {
+//                            throw new AssertionError();
+//                        }
+                        lastProgress = progress;
+                    }
+                    public void onStartTrackingTouch(SeekBar seekBar) {
+                    }
+                    public void onStopTrackingTouch(SeekBar seekBar) {
+                        int attenuation = 100 - lastProgress;
+                        int millibel = attenuation * -50;
+                        setVolumeUriAudioPlayer(millibel);
+                    }
+                });
+
+        ((SeekBar) findViewById(R.id.pan_uri)).setOnSeekBarChangeListener(
+                new OnSeekBarChangeListener() {
+                    int lastProgress = 100;
+                    public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+//                        if (BuildConfig.DEBUG && !(progress >= 0 && progress <= 100)) {
+//                            throw new AssertionError();
+//                        }
+                        lastProgress = progress;
+                    }
+                    public void onStartTrackingTouch(SeekBar seekBar) {
+                    }
+                    public void onStopTrackingTouch(SeekBar seekBar) {
+                        int permille = (lastProgress - 50) * 20;
+                        setStereoPositionUriAudioPlayer(permille);
+                    }
+                });
+        if (false){
+//        if (Build.VERSION.SDK_INT > 19) {
+                int[]  uriIds = { R.id.uri_soundtrack, R.id.pause_uri,
+                        R.id.play_uri,       R.id.loop_uri,
+                        R.id.mute_left_uri,  R.id.mute_right_uri,
+                        R.id.solo_left_uri,  R.id.solo_right_uri,
+                        R.id.mute_uri,       R.id.enable_stereo_position_uri,
+                        R.id.channels_uri,   R.id.volume_uri,
+                        R.id.pan_uri,        R.id.uri_spinner,};
+                for(int id : uriIds)
+                    findViewById(id).setEnabled(false);
+//            }
+        }
+
+        ((Button) findViewById(R.id.record)).setOnClickListener(new OnClickListener() {
+            public void onClick(View view) {
+                int status = ActivityCompat.checkSelfPermission(AudioRecordActivity.this,
+                        Manifest.permission.RECORD_AUDIO);
+                if (status != PackageManager.PERMISSION_GRANTED) {
+                    ActivityCompat.requestPermissions(
+                            AudioRecordActivity.this,
+                            new String[]{Manifest.permission.RECORD_AUDIO},
+                            AUDIO_ECHO_REQUEST);
+                    return;
+                }
+                recordAudio();
+            }
+        });
+
+        ((Button) findViewById(R.id.playback)).setOnClickListener(new OnClickListener() {
+            public void onClick(View view) {
+                // ignore the return value
+                selectClip(CLIP_PLAYBACK, 3);
+            }
+        });
+
+    }
+
+    // Single out recording for run-permission needs
+    static boolean created = false;
+    private void recordAudio() {
+        if (!created) {
+            created = createAudioRecorder();
+        }
+        if (created) {
+            startRecording();
+        }
+    }
+
+    /** Called when the activity is about to be destroyed. */
+    @Override
+    protected void onPause()
+    {
+        // turn off all audio
+        selectClip(CLIP_NONE, 0);
+        isPlayingAsset = false;
+        setPlayingAssetAudioPlayer(false);
+        isPlayingUri = false;
+        setPlayingUriAudioPlayer(false);
+        super.onPause();
+    }
+
+    /** Called when the activity is about to be destroyed. */
+    @Override
+    protected void onDestroy()
+    {
+        shutdown();
+        super.onDestroy();
+    }
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        /*
+         * if any permission failed, the sample could not play
+         */
+        if (AUDIO_ECHO_REQUEST != requestCode) {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+            return;
+        }
+
+        if (grantResults.length != 1  ||
+                grantResults[0] != PackageManager.PERMISSION_GRANTED) {
+            /*
+             * When user denied the permission, throw a Toast to prompt that RECORD_AUDIO
+             * is necessary; on UI, we display the current status as permission was denied so
+             * user know what is going on.
+             * This application go back to the original state: it behaves as if the button
+             * was not clicked. The assumption is that user will re-click the "start" button
+             * (to retry), or shutdown the app in normal way.
+             */
+            Toast.makeText(getApplicationContext(),
+                            getString(R.string.NeedRecordAudioPermission),
+                            Toast.LENGTH_SHORT)
+                    .show();
+            return;
+        }
+
+        // The callback runs on app's thread, so we are safe to resume the action
+        recordAudio();
+    }
 
     /** Native methods, implemented in jni folder */
     public static native void createEngine();
@@ -114,248 +402,9 @@ public class AudioRecordActivity extends AppCompatActivity implements ActivityCo
     public static native void startRecording();
     public static native void shutdown();
 
-
-
-
-
-
-
-
-    @Override
-    public void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        setTheme(R.style.AppTheme);
-        setContentView(R.layout.audio);
-        int v = 9;
-
+    /** Load jni .so on initialization */
+    static {
         System.loadLibrary("audio");
-
-//        int i = test(v);
-//        String s = stringFromJNI();
-//        String s = Java_com_example_audio_AudioRecordActivity_stringFromJNI();
-
-        startButton = (Button) findViewById(R.id.btnStart);
-        blockCountTv = (TextView) findViewById(R.id.blockCount);
-        startButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                startRecording();
-                startButton.setEnabled(false);
-                stopButton.setEnabled(true);
-            }
-        });
-
-        boolean b = hasPermissions();
-        stopButton = (Button) findViewById(R.id.btnStop);
-        stopButton.setOnClickListener(new View.OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                stopRecording();
-                startButton.setEnabled(true);
-                stopButton.setEnabled(false);
-
-            }
-        });
-    }
-
-    @Override
-    protected void onResume() {
-        super.onResume();
-
-//        startButton.setEnabled(true);
-//        stopButton.setEnabled(false);
-    }
-
-    @Override
-    protected void onPause() {
-        super.onPause();
-
-        //stopRecording();
-    }
-
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-        switch (requestCode) {
-            case 41: {
-                if (grantResults.length > 0
-                        && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    Log.d("MG", "RECORD_AUDIO permission was granted");
-                } else {
-                    Log.d("MG", "RECORD_AUDIO permission was denied");
-                }
-            }
-            case 42: {
-                if (grantResults.length > 0
-                        && grantResults[1] == PackageManager.PERMISSION_GRANTED) {
-                    Log.d("MG", "WRITE_EXTERNAL_STORAGE permission was granted");
-                } else {
-                    Log.d("MG", "WRITE_EXTERNAL_STORAGE permission was denied");
-                }
-            }
-            case 43: {
-                if (grantResults.length > 0
-                        && grantResults[2] == PackageManager.PERMISSION_GRANTED) {
-                    Log.d("MG", "READ_EXTERNAL_STORAGE permission was granted");
-                } else {
-                    Log.d("MG", "READ_EXTERNAL_STORAGE permission was denied");
-                }
-            }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private void startRecording() {
-
-        recordingThread = new Thread(new RecordingRunnable(), "Recording Thread");
-
-        block_count = 0;
-        recorder = new AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLING_RATE_IN_HZ,
-                CHANNEL_CONFIG, AUDIO_FORMAT, BUFFER_SIZE);
-
-        recordingInProgress.set(true);
-        recorder.startRecording();
-
-        if (recordingThread != null) {
-            recordingThread.start();
-        }
-        else {
-            Log.d("TAG", "recordingThread is not null");
-        }
-    }
-
-    private boolean hasPermissions() {
-
-        int permissionsCode = 42;
-        String[] permissions = {Manifest.permission.RECORD_AUDIO,  Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.READ_EXTERNAL_STORAGE};
-        Log.d("TAG", "Requesting Permissions");
-        requestPermissions(permissions, permissionsCode);
-
-        return true;
-    }
-
-    private void stopRecording() {
-        if (null == recorder) {
-            return;
-        }
-
-        recordingInProgress.set(false);
-        recorder.stop();
-        recorder.release();
-        recorder = null;
-
-    }
-
-    private class RecordingRunnable implements Runnable {
-
-        @Override
-        public  void run() {
-            int result;
-            int accum_result = 0;
-            int x = 0;
-            short v = 0;
-            short max = 0;
-            boolean fcreated = false;
-            FileOutputStream fos = null;
-
-            //final File file = new File(Environment.getExternalStorageDirectory(), "MG/recording.pcm");
-            File dir = commonDocumentDirPath("MG");
-            final File file = new File(dir, "recording.pcm");
-            final ByteBuffer buffer = ByteBuffer.allocateDirect(BUFFER_SIZE );
-
-            Log.d("TAG", "run method invoked");
-
-            try {
-                if (!file.exists()) {
-                    if (file.createNewFile()){
-                        fcreated = true;
-                    }
-                    else {
-                        fcreated = false;
-                        return;
-                    }
-                }
-                else  {
-                    fos = new FileOutputStream(file);
-                }
-            } catch (Exception e) {
-                Log.e("TAG", e.getMessage());
-            }
-
-            while (recordingInProgress.get()) {
-
-                v=0;
-                max=0;
-                result = recorder.read(buffer,  BUFFER_SIZE );
-                if (result < 0) {
-                    throw new RuntimeException("Reading of audio buffer failed: " +
-                            getBufferReadFailureReason(result));
-                }
-
-               // max = get_max(buffer, BUFFER_SIZE );
-
-                try {
-                    fos.write(buffer.array(), 0, BUFFER_SIZE );
-                } catch (IOException e) {
-                    throw new RuntimeException("Writing of data block to file failed: ", e);
-                }
-                buffer.clear();
-                block_count++;
-                accum_result += result;
-                blockCountTv.setText("MaxV: " + Integer.toString(max) + "  Blocks:" + Integer.toHexString(block_count) + ",    KBytes: " + Integer.toString(accum_result/1024));
-                if (block_count > 200) {
-                    recordingInProgress.set(false);
-                }
-            }
-            try {
-                Log.d("TAG", "Closing file, wrote " + Integer.toString(block_count) + " blocks");
-                fos.close();
-            } catch (IOException e) {
-                throw new RuntimeException("Closing File failed: ", e);
-            }
-        }
-
-        private String getBufferReadFailureReason(int errorCode) {
-            switch (errorCode) {
-                case AudioRecord.ERROR_INVALID_OPERATION:
-                    return "ERROR_INVALID_OPERATION";
-                case AudioRecord.ERROR_BAD_VALUE:
-                    return "ERROR_BAD_VALUE";
-                case AudioRecord.ERROR_DEAD_OBJECT:
-                    return "ERROR_DEAD_OBJECT";
-                case AudioRecord.ERROR:
-                    return "ERROR";
-                default:
-                    return "Unknown (" + errorCode + ")";
-            }
-        }
-    }
-
-
-    public static File commonDocumentDirPath(String FolderName)
-    {
-        File dir = null;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
-        {
-            dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS) + "/" + FolderName);
-        }
-        else
-        {
-            dir = new File(Environment.getExternalStorageDirectory() + "/" + FolderName);
-        }
-
-        // Make sure the path directory exists.
-        if (!dir.exists())
-        {
-            // Make it, if it doesn't exit
-            boolean success = dir.mkdirs();
-            if (!success)
-            {
-                dir = null;
-            }
-        }
-        return dir;
     }
 
 }
